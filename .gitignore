@@ -160,3 +160,12 @@ cython_debug/
 #.idea/
 
 config/config.yml
+
+# Operational data + backups/vendored wheels — never commit (live-only)
+config/device_map.yml
+device_map.yml
+*.bak
+*.bak-*
+*.predebug-*
+*.whl
+aiopjlink-old/
