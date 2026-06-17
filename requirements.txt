@@ -1,7 +1,0 @@
-asyncclick==8.1.3.4
-anyio==3.6.2
-uvloop==0.17.0
-git+https://github.com/sbtinstruments/asyncio-mqtt#cce4e2573f096cc62b0e3d505b10c2fb0a64649b
-wakeonlan==3.0.0
-icmplib==3.0.3
-requests==2.30.0
