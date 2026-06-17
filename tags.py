@@ -57,19 +57,19 @@ class Tag:
 
     @property
     def network_switches(self) -> list[Device]:
-        return [device for device in self.devices if device.role == 'Netzwerkswitch']
+        return [device for device in self.devices if device.role['name'] == 'Netzwerkswitch']
 
     @property
     def pdus(self) -> list[Device]:
-        return [device for device in self.devices if device.role == 'PDU']
+        return [device for device in self.devices if device.role['name'] == 'PDU']
 
     @property
     def display_devices(self) -> list[Device]:
-        return [device for device in self.devices if device.role in ['Monitor', 'Projektor']]
+        return [device for device in self.devices if device.role['name'] in ['Monitor', 'Projektor']]
 
     @property
     def computers(self) -> list[Device]:
-        return [device for device in self.devices if 'Medienstation' in device.role]
+        return [device for device in self.devices if device.role['name'] in ['Medienstation', 'PC']]
 
     @property
     def other_devices(self) -> list[Device]:
@@ -168,6 +168,10 @@ class Tag:
 
     async def scram(self, **__):
         logger.error('BMZ Scram %s', self.name)
+        logger.error('BMZ Scram %s devices=%d computers=%d displays=%d mutable=%d',
+                 self.name, len(self.devices), len(self.computers),
+                 len(self.display_devices),
+                 len([d for d in self.computers if 'mute' in d._capabilities]))
         mutable = [
             device for device in self.computers if 'mute' in device._capabilities]
         await self.call(mutable, 'mute')

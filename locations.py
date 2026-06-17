@@ -97,11 +97,15 @@ class Location:
         logger.error('KNX %s %s', self.name, kwargs)
         logger.error('KNX %s %s', self.name, kwargs['state'])
         if kwargs['state']:
+            # just a debugging log (change: DA 4.6. 2025)
+            logger.debug('KNX ON signal received for %s', self.name)
             await self.set_knx_state(KNXState.ON)
             if self.has_calendar_event and self.last_calendar_method == 'shutdown':
                 return
             else:
-                await self.wake(from_knx=True)
+                # prevent knx from waking devices (change: DA 4.6. 2025)
+                logger.info('KNX ON signal received for %s - will be ignored', self.name)
+                return # await self.wake(from_knx=True)
         else:
             await self.shutdown()
             await self.set_knx_state(KNXState.OFF)
