@@ -12,7 +12,7 @@ import yaml
 
 
 if not os.path.isfile('./config/config.yml'):
-    shutil.copyfile('./config/base_config.yml', './config/config.yml')
+    shutil.copyfile('./config/default_config.yml', './config/config.yml')
 
 
 logger = logging.getLogger()
