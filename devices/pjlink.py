@@ -128,17 +128,9 @@ class PJLink(Device):
             await self.event('errors', self._state['errors'])
 
     async def _update_lamps(self, lamps):
-        has_lamps_event = self._state['lamps'] != len(lamps)
-        if has_lamps_event:
-            self._state['lamps'] = [(hours, int(state.value)) for hours, state in lamps]
-        else:
-            for i, lamp in enumerate(lamps):
-                lamp_hours = lamp[0]
-                lamp_state = int(lamp[1])
-                if lamp_hours != self._state['lamps'][i][0] or self._state['lamps'][i][1] != lamp_state:
-                    self._state['lamps'][i][0] = (lamp_hours, lamp_state)
-                    has_lamps_event = True
-        if has_lamps_event:
+        new_lamps = [(hours, int(state.value)) for hours, state in lamps]
+        if new_lamps != self._state['lamps']:
+            self._state['lamps'] = new_lamps
             await self.event('lamps', self._state['lamps'])
             
     async def _update_class(self, interface):

@@ -35,14 +35,12 @@ class Device(EventMixin, ErrorMixin, PowerMixin, CalendarMixin):
         self.id: int = data['id']
         self.tags = data['tags']
         self.location = data['location']
-        try:
-            # geändert: DA Update Netbox
-            # self.role = data['device_role']['name']
-            self.role = data['role']['name']
-        except:
-            self.role = ''
         for key, value in data.items():
             setattr(self, key, value)
+        # NetBox renamed device_role -> role (3.6). The loop above sets self.role
+        # to the role dict when present; ensure it is always defined otherwise.
+        if not hasattr(self, 'role'):
+            self.role = None
         try:
             self.name = data['primary_ip']['dns_name']
         except Exception:

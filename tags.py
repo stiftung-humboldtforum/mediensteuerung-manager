@@ -7,6 +7,12 @@ from devices.state import DeviceState
 from misc import logger
 
 
+def _role_name(device: Device):
+    # device.role is the NetBox role dict (or None if the device has no role).
+    role = getattr(device, 'role', None)
+    return role['name'] if isinstance(role, dict) else None
+
+
 class TagState:
     OFFLINE = 0
     PARTIAL = 1
@@ -57,19 +63,19 @@ class Tag:
 
     @property
     def network_switches(self) -> list[Device]:
-        return [device for device in self.devices if device.role['name'] == 'Netzwerkswitch']
+        return [device for device in self.devices if _role_name(device) == 'Netzwerkswitch']
 
     @property
     def pdus(self) -> list[Device]:
-        return [device for device in self.devices if device.role['name'] == 'PDU']
+        return [device for device in self.devices if _role_name(device) == 'PDU']
 
     @property
     def display_devices(self) -> list[Device]:
-        return [device for device in self.devices if device.role['name'] in ['Monitor', 'Projektor']]
+        return [device for device in self.devices if _role_name(device) in ['Monitor', 'Projektor']]
 
     @property
     def computers(self) -> list[Device]:
-        return [device for device in self.devices if device.role['name'] in ['Medienstation', 'PC']]
+        return [device for device in self.devices if _role_name(device) in ['Medienstation', 'PC']]
 
     @property
     def other_devices(self) -> list[Device]:

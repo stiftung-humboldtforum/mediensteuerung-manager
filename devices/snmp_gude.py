@@ -128,31 +128,29 @@ class GudePDU(ICMPable):
                               for i, value in enumerate(powerfeeds)]
         async with asyncio.timeout(WRITE_POWERFEEDS_TIMEOUT):
             while any([powerfeeds[i] != self._state['powerfeeds'][i] for i in range(self.num_powerfeeds)]):
-                await self.lock.acquire()
-                try:
-                    async with self.snmp_client as client:
-                        res = await client.set(messages)
-                        self._state['powerfeeds'] = [x.value == 1 for x in res]
-                        logger.debug('%s powerfeeds %s', self.name,
-                                     self._state['powerfeeds'])
-                        await self.event('powerfeeds', self._state['powerfeeds'])
-                except Exception as e:
-                    await self._handle_exception(e)
-                    await asyncio.sleep(5)
-                self.lock.release()
+                async with self.lock:
+                    try:
+                        async with self.snmp_client as client:
+                            res = await client.set(messages)
+                            self._state['powerfeeds'] = [x.value == 1 for x in res]
+                            logger.debug('%s powerfeeds %s', self.name,
+                                         self._state['powerfeeds'])
+                            await self.event('powerfeeds', self._state['powerfeeds'])
+                    except Exception as e:
+                        await self._handle_exception(e)
+                        await asyncio.sleep(5)
 
     async def write_powerfeed(self, id=None, value=None):
         if id is None or value is None:
             return
 
-        while not self.is_ready:
-            await asyncio.sleep(1)
         logger.debug('name=%s, id=%s, value=%s', self.name, id, value)
         powerfeeds = [*self._state['powerfeeds']]
         powerfeeds[id] = value
         if '_write_powerfeeds' in self.tasks and not self.tasks['_write_powerfeeds'].done():
+            # Cancel the in-flight write; it now uses `async with self.lock`, which
+            # releases the lock on cancellation — so do NOT release it here.
             self.tasks['_write_powerfeeds'].cancel()
-            self.lock.release()
         task = asyncio.create_task(self._try_method(
             self._write_powerfeeds, powerfeeds=powerfeeds))
         self.tasks['_write_powerfeeds'] = task

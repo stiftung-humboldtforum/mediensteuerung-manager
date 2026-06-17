@@ -31,7 +31,7 @@ class Api:
             verify=os.environ['API_ROOT_CA'])
         self.token = response.json()['access_token']
 
-    def get(self, path):
+    def get(self, path, _retried=False):
         headers = {
             'authorization': f'Bearer {self.token}'
         }
@@ -40,11 +40,11 @@ class Api:
             headers=headers,
             verify=os.environ['API_ROOT_CA'],
             timeout=120)
-        if response.status_code == 401:
+        if response.status_code == 401 and not _retried:
+            # one-shot re-login retry; avoid unbounded recursion on persistent 401
             self.login()
-            return self.get(path)
-        else:
-            return response
+            return self.get(path, _retried=True)
+        return response
 
 
 class Manager:
@@ -58,37 +58,47 @@ class Manager:
     async def setup(self, initial=False):
         self.config = get_config()
         self.device_map = self.config['device_map']['value']
-        await self.lock.acquire()
-        try:
-            response = self.api.get('/api/')
-            try:
-                response = response.json()
-            except Exception as e:
-                logger.exception(e)
-                logger.error(response)
-                exit(1)
-            devices = response['devices']
-            tags = response['tags']
-            locations = response['locations']
-            if initial:
-                self.devices: dict[int, Device] = {}
-                self.tags: dict[int, Tag] = {}
-                self.locations: dict[int, Location] = {}
-            await self.subscribe_devices(devices)
-            await self.subscribe_tags(tags)
-            await self.subscribe_locations(locations)
-        except Exception as e:
-            logger.exception(e)
-            await self.setup()
-        self.lock.release()
+        # Retry on failure WITHOUT recursing while holding the lock: asyncio.Lock
+        # is not reentrant, so a recursive setup() under a held lock deadlocks.
+        while True:
+            async with self.lock:
+                try:
+                    response = self.api.get('/api/').json()
+                    devices = response['devices']
+                    tags = response['tags']
+                    locations = response['locations']
+                    if initial:
+                        self.devices: dict[int, Device] = {}
+                        self.tags: dict[int, Tag] = {}
+                        self.locations: dict[int, Location] = {}
+                    await self.subscribe_devices(devices)
+                    await self.subscribe_tags(tags)
+                    await self.subscribe_locations(locations)
+                    return
+                except Exception as e:
+                    logger.exception(e)
+            await asyncio.sleep(5)
 
-    def delete_task(self, task_name):
-        def wrap(_):
-            try:
-                del self.tasks[task_name]
-            except Exception:
-                pass
+    def delete_task(self, task_name, task=None):
+        def wrap(finished):
+            # Only drop the entry if it still refers to this task — a newer task
+            # may have replaced it after a cancel-then-replace.
+            if task is None or self.tasks.get(task_name) is finished:
+                self.tasks.pop(task_name, None)
         return wrap
+
+    def _resolve_method(self, obj, method_name):
+        # Guard the getattr dispatch: a method name comes verbatim from an MQTT
+        # topic segment, so reject private/dunder names and non-callables to keep
+        # it from reaching internal attributes.
+        if not isinstance(method_name, str) or method_name.startswith('_'):
+            logger.error('Rejected method name %r', method_name)
+            return None
+        method = getattr(obj, method_name, None)
+        if not callable(method):
+            logger.error('Unknown method %r on %s', method_name, type(obj).__name__)
+            return None
+        return method
 
     def healthcheck(self):
         if int(time.time()) % 30 == 0: 
@@ -109,14 +119,6 @@ class Manager:
             await self.lock.acquire()
             await self.update_devices()
             self.lock.release()
-
-    async def idle(self):
-        while not all([device.is_idle() for device in self.devices.values()]):
-            await asyncio.sleep(1)
-
-    async def on_message(self, topic, payload):
-        ...
-        # logger.info('%s %s', topic, payload)
 
     async def subscribe_devices(self, devices):
         if isinstance(devices, list):
@@ -222,13 +224,15 @@ class Manager:
         if device_id not in self.devices:
             logger.error('Device with id "%s" not subscribed', device_id)
             return
+        method = self._resolve_method(self.devices[device_id], method_name)
+        if method is None:
+            return
         task_name = f'{self.devices[device_id].name}_{method_name}'
         task = asyncio.create_task(
-            self.devices[device_id]._try_method(
-                getattr(self.devices[device_id], method_name), **params)
+            self.devices[device_id]._try_method(method, **params)
         )
         self.tasks[task_name] = task
-        task.add_done_callback(self.delete_task(method_name))
+        task.add_done_callback(self.delete_task(task_name, task))
 
     async def tag_method(self, method_name, kwargs):
         tag = kwargs['data']
@@ -237,16 +241,17 @@ class Manager:
         if tag_id not in self.tags:
             logger.error('Tag with id "%s" not subscribed', tag_id)
             return
+        method = self._resolve_method(self.tags[tag_id], method_name)
+        if method is None:
+            return
         task_name = f'{self.tags[tag_id].name}'
-        task = asyncio.create_task(
-            getattr(self.tags[tag_id], method_name)(**params)
-        )
+        task = asyncio.create_task(method(**params))
         try:
             self.tasks[task_name].cancel()
         except:
             pass
         self.tasks[task_name] = task
-        task.add_done_callback(self.delete_task(task_name))
+        task.add_done_callback(self.delete_task(task_name, task))
 
     async def location_method(self, method_name, kwargs):
         location = kwargs['data']
@@ -255,13 +260,14 @@ class Manager:
         if location_id not in self.locations:
             logger.error('Location with id "%s" not subscribed', location_id)
             return
+        method = self._resolve_method(self.locations[location_id], method_name)
+        if method is None:
+            return
         task_name = f'{self.locations[location_id].name}'
-        task = asyncio.create_task(
-            getattr(self.locations[location_id], method_name)(**params)
-        )
+        task = asyncio.create_task(method(**params))
         try:
             self.tasks[task_name].cancel()
         except:
             pass
         self.tasks[task_name] = task
-        task.add_done_callback(self.delete_task(task_name))
+        task.add_done_callback(self.delete_task(task_name, task))

@@ -49,8 +49,9 @@ class Computer(WOLable):
 
             async def method(args):
                 method.__name__ = __name
-                payload = json.loads(args)
+                payload = {}
                 try:
+                    payload = json.loads(args)
                     if name not in self._state:
                         return
                     result = payload['data']['result']
@@ -65,7 +66,9 @@ class Computer(WOLable):
                         await self._handle_exception(e)
             return method
         else:
-            return getattr(self, __name)
+            # Delegate to the parent __getattr__ (Device); calling getattr(self, ...)
+            # here would re-enter this __getattr__ and recurse infinitely.
+            return super().__getattr__(__name)
 
     async def on_connect(self):
         await self.client.subscribe(self.probe_topic)
@@ -205,17 +208,22 @@ class Computer(WOLable):
     async def shutdown(self, *_, **__):
         await self.cancel()
         logger.debug('Shutting down %s', self.name)
-        await self.set_should_shutdown(self.is_online == DeviceState.ON)
+        was_on = self.is_online == DeviceState.ON
+        await self.set_should_shutdown(was_on)
+        if not was_on:
+            # Already off — don't run a soft-shutdown task and don't power-cycle.
+            return
         if 'shutdown' in self.tasks:
             self.tasks['shutdown'].cancel()
         task = asyncio.create_task(self._try_method(
             self._shutdown, error_cb=self.set_should_shutdown(False)))
         self.tasks['shutdown'] = task
 
-        def power_off_done(_):
+        def power_off_done(finished):
             logger.debug('%s power_off_done', self.name)
             self.power_cycle(wait=10)
-            self._delete_task('shutdown')
+            # _delete_task returns the callback; invoke it to actually drop the task
+            self._delete_task('shutdown')(finished)
         task.add_done_callback(power_off_done)
 
     async def reboot(self, *_, **__):

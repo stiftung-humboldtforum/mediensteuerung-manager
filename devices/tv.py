@@ -23,7 +23,7 @@ class LGWebOSTV(WOLable):
         self._state['is_registered'] = False
         self.update_methods.append(('ping', self.ping))
         self.update_methods.append(('register_client', self.register_client))
-        self.loop = asyncio.get_event_loop()
+        self.loop = asyncio.get_running_loop()
         self.ip = getattr(self, 'primary_ip')['address'].split('/')[0]
         self.init_client()
 
@@ -47,7 +47,8 @@ class LGWebOSTV(WOLable):
             try:
                 logger.debug('try_connect webosclient connect')
                 async with asyncio.timeout(10):
-                    self.webosclient.connect()
+                    # ws4py connect() is blocking; run off the event loop
+                    await asyncio.to_thread(self.webosclient.connect)
             except Exception as e:
                 self.webosclient.close()
                 logger.exception(e)
@@ -67,17 +68,21 @@ class LGWebOSTV(WOLable):
         if self.is_connected and not self.is_registered:
             logger.debug('register...')
             try:
-                with open('/opt/weboscreds.json', 'r+') as f:
-                    store = json.loads(f.read())
-                    list(self.webosclient.register(store, timeout=1))
-                    f.seek(0)
-                    f.write(json.dumps(store))
-                    f.truncate()
+                # register() + file I/O are blocking; run off the event loop
+                await asyncio.to_thread(self._register_blocking)
                 self.is_registered = True
                 logger.debug('registered!')
             except Exception as e:
                 await self._handle_exception(e)
                 self.init_client()
+
+    def _register_blocking(self):
+        with open('/opt/weboscreds.json', 'r+') as f:
+            store = json.loads(f.read())
+            list(self.webosclient.register(store, timeout=1))
+            f.seek(0)
+            f.write(json.dumps(store))
+            f.truncate()
 
     @property
     def is_connected(self):
