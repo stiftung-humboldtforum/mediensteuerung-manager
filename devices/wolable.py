@@ -1,4 +1,5 @@
 import asyncio
+import ipaddress
 
 from wakeonlan import send_magic_packet
 
@@ -7,14 +8,29 @@ from misc import logger
 from .device import DeviceState
 from .icmpable import ICMPable
 
+WAKE_INTERVAL = 60
+
+
+def _parse_wol_targets(cidrs):
+    """['192.0.2.3/24', ...] -> [(broadcast_ip, source_ip), ...].
+    Ungültige Einträge werden übersprungen und geloggt."""
+    targets = []
+    for entry in cidrs or []:
+        try:
+            iface = ipaddress.IPv4Interface(entry)
+        except ValueError:
+            logger.warning('Ungültiger wol_broadcast_targets-Eintrag: %r', entry)
+            continue
+        targets.append((str(iface.network.broadcast_address), str(iface.ip)))
+    return targets
+
 
 class WOLable(ICMPable):
     _capabilities = ['wake']
 
-    def __init__(self, *args, wake_interval: float = 60, max_time_to_wake: float = 900, **kwargs):
+    def __init__(self, *args, max_time_to_wake: float = 900, **kwargs):
         super().__init__(*args, **kwargs)
         self._state['should_wake'] = False
-        self.intervals['wake_interval'] = wake_interval
         self.timeouts['wake'] = max_time_to_wake
         self.event.append(self.online_event)
 
@@ -32,7 +48,12 @@ class WOLable(ICMPable):
 
     async def _wake(self):
         async with asyncio.timeout(self.timeouts['wake']):
+            cfg = self.manager.config.get('wol_broadcast_targets') or {}
+            targets = _parse_wol_targets(cfg.get('value'))
             while self.should_wake:
+                logger.info('WoL-DEBUG %s: is_online=%s should_wake=%s targets=%s macs=%s',
+                            self.name, self.is_online, self.should_wake, targets,
+                            [i.get('mac_address') for i in getattr(self, 'interfaces', [])])
                 if not self.is_online == DeviceState.ON:
                     interfaces = getattr(self, 'interfaces')
                     for interface in interfaces:
@@ -41,10 +62,22 @@ class WOLable(ICMPable):
                             break
                         mac_address: str = interface['mac_address']
                         if mac_address:
-                            send_magic_packet(mac_address)
+                            if targets:
+                                for broadcast_ip, source_ip in targets:
+                                    try:
+                                        send_magic_packet(mac_address,
+                                                          ip_address=broadcast_ip,
+                                                          interface=source_ip)
+                                        logger.info('WoL-SEND ok %s -> %s via %s',
+                                                    mac_address, broadcast_ip, source_ip)
+                                    except Exception as e:
+                                        logger.error('WoL-SEND FAIL %s -> %s via %s: %r',
+                                                     mac_address, broadcast_ip, source_ip, e)
+                            else:
+                                send_magic_packet(mac_address)
                         else:
                             await self.set_should_wake(False)
-                    await asyncio.sleep(self.intervals['wake_interval'])
+                    await asyncio.sleep(WAKE_INTERVAL)
                 elif self.is_online == DeviceState.ON:
                     await self.set_should_wake(False)
 

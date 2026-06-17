@@ -1,6 +1,5 @@
 import os
 import asyncio
-import traceback
 from functools import cached_property
 from typing import Sequence
 
@@ -58,17 +57,8 @@ def get_port_state_oid(device_model):
 
 
 class GudePDU(ICMPable):
-    def __init__(self,
-                 *args,
-                 watch_interval: float = 10,
-                 snmp_timeout: float = 5,
-                 snmp_retries: float = 2,
-                 write_powerfeeds_timeout: float = 900,
-                 **kwargs):
+    def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.intervals['watch'] = watch_interval
-        self.timeouts['write_powerfeeds'] = write_powerfeeds_timeout
-
         self.model = getattr(self, 'device_type')['model']
         try:
             self._state['powerfeeds'] = [-1] * self.num_powerfeeds
@@ -82,7 +72,7 @@ class GudePDU(ICMPable):
         ip = getattr(self, 'primary_ip')
         address = ip['address'].split('/')[0]
         self.snmp_client = aiosnmp.Snmp(
-            host=address, community=PDU_COMMUNITYSTRING, timeout=snmp_timeout, retries=snmp_retries)
+            host=address, community=PDU_COMMUNITYSTRING, timeout=5, retries=2)
 
     @cached_property
     def num_powerfeeds(self):
@@ -100,6 +90,7 @@ class GudePDU(ICMPable):
     async def online_event(self, _, event_type, value):
         if event_type == 'is_online':
             if value == DeviceState.ON:
+                await self.lock.acquire()
                 try:
                     async with self.snmp_client as client:
                         await self._read_powerfeeds(client)
@@ -107,6 +98,7 @@ class GudePDU(ICMPable):
                     logger.exception(self.name)
                     await self._handle_exception(e)
                     await self.set_is_online(DeviceState.PARTIAL)
+                self.lock.release()
 
     async def _read_powerfeeds(self, client):
         res = await client.get(self.port_state_oids)
@@ -118,7 +110,7 @@ class GudePDU(ICMPable):
             self._state['powerfeeds'] = powerfeeds
             await self.event('powerfeeds', self._state['powerfeeds'])
 
-    @memoize('watch')
+    @memoize(10)
     async def _watch_powerfeeds(self):
         if self.is_online == DeviceState.ON:
             await self.lock.acquire()
@@ -134,7 +126,7 @@ class GudePDU(ICMPable):
             return
         messages: Sequence = [(f'{self.port_state_oid}{i+1}', 1 if value else 0)
                               for i, value in enumerate(powerfeeds)]
-        async with asyncio.timeout(self.timeouts['write_powerfeeds']):
+        async with asyncio.timeout(WRITE_POWERFEEDS_TIMEOUT):
             while any([powerfeeds[i] != self._state['powerfeeds'][i] for i in range(self.num_powerfeeds)]):
                 await self.lock.acquire()
                 try:
