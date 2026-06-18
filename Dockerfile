@@ -1,4 +1,7 @@
-FROM python:3.12-slim
+# Stays on 3.11: aiosnmp 0.7.2 (latest, unmaintained) ships no cp312 wheel, so
+# 3.12 would force a Rust source-build of aiosnmp. 3.11 has the cp311 wheel and
+# is supported until 2027. (api/calendar/knx/fac are on 3.12-slim.)
+FROM python:3.11-slim
 RUN apt-get update && apt-get install -qq git iputils-ping
 RUN pip install --no-cache-dir --upgrade pip
 RUN pip install --no-cache-dir --upgrade \
