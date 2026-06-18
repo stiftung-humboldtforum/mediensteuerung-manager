@@ -39,7 +39,6 @@ class PJLink(Device):
         ip = getattr(self, 'primary_ip')
         address = ip['address'].split('/')[0]
         self.ip = address
-        self.is_open = False
 
         self._interface = None
         self.update_methods.append(('PJLink watch', self._watch))
@@ -62,24 +61,6 @@ class PJLink(Device):
             await self.set_should_shutdown(self.should_shutdown and value not in [DeviceState.OFF, DeviceState.PARTIAL])
             if value != DeviceState.ON:
                 self._reset_state()
-
-    async def _open(self):
-        if self._interface is None:
-            self._interface = await self._get_interface()
-        async with self.lock:
-            if not self.is_open:
-                try:
-                    await self._interface.__aenter__()
-                except:
-                    self._interface = None
-                    raise
-                self.is_open = True
-        return self._interface
-
-    async def _close(self):
-        async with self.lock:
-            await self._interface.__aexit__(None, None, None)
-            self.is_open = False
 
     async def _set_power_state(self, power_state: Power.State):
         match power_state:
@@ -194,7 +175,7 @@ class PJLink(Device):
             async with self._interface as interface:
                 logger.debug(
                     'Authentication succeeded, set_power off')
-                await self._interface.power.turn_off()
+                await interface.power.turn_off()
         async with asyncio.timeout(self.timeouts['shutdown']):
             while self.should_shutdown:
                 if self.is_online == DeviceState.ON:
