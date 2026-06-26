@@ -159,9 +159,16 @@ class LGWebOSTV(WOLable):
     async def shutdown(self, *_, **__):
         try:
             # The link may be briefly down while the TV is still physically on;
-            # try to (re)connect before giving up so the command isn't dropped.
+            # (re)connect before giving up so the command isn't dropped. If a
+            # connect is already in flight (online_event/register_client), wait
+            # for it to settle instead of bailing on the half-open client.
             if self.client is None or not self.client.is_connected():
-                await self.try_connect()
+                if self._connecting:
+                    async with asyncio.timeout(20):
+                        while self._connecting:
+                            await asyncio.sleep(0.25)
+                else:
+                    await self.try_connect()
             if self.client is not None and self.client.is_connected():
                 await self.client.power_off()
                 await self.set_should_shutdown(True)
