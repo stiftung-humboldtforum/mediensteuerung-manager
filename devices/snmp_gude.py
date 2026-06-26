@@ -3,7 +3,17 @@ import asyncio
 from functools import cached_property
 from typing import Sequence
 
-import aiosnmp
+from pysnmp.hlapi.v3arch.asyncio import (
+    CommunityData,
+    ContextData,
+    Integer32,
+    ObjectIdentity,
+    ObjectType,
+    SnmpEngine,
+    UdpTransportTarget,
+    get_cmd,
+    set_cmd,
+)
 
 from misc import logger, memoize
 
@@ -12,6 +22,9 @@ from .icmpable import ICMPable
 
 PDU_COMMUNITYSTRING = os.environ['PDU_COMMUNITYSTRING']
 
+SNMP_PORT = 161
+SNMP_TIMEOUT = 5
+SNMP_RETRIES = 2
 WRITE_POWERFEEDS_TIMEOUT = 900
 
 
@@ -71,8 +84,22 @@ class GudePDU(ICMPable):
         self.event.append(self.online_event)
         ip = getattr(self, 'primary_ip')
         address = ip['address'].split('/')[0]
-        self.snmp_client = aiosnmp.Snmp(
-            host=address, community=PDU_COMMUNITYSTRING, timeout=5, retries=2)
+        self.snmp_host = address
+        # pysnmp's asyncio HLAPI is call-based (no aiosnmp-style connection
+        # context manager): each get_cmd/set_cmd takes the engine + per-call
+        # transport target. One reusable SNMPv2c engine + community per device.
+        self.snmp_engine = SnmpEngine()
+        self.snmp_community = CommunityData(PDU_COMMUNITYSTRING, mpModel=1)
+        self._snmp_target = None
+
+    async def _target(self):
+        # Built lazily (UdpTransportTarget.create is async) and reused across
+        # GET/SET so the ~10s poller doesn't churn a new UDP socket each call.
+        if self._snmp_target is None:
+            self._snmp_target = await UdpTransportTarget.create(
+                (self.snmp_host, SNMP_PORT),
+                timeout=SNMP_TIMEOUT, retries=SNMP_RETRIES)
+        return self._snmp_target
 
     @cached_property
     def num_powerfeeds(self):
@@ -87,22 +114,61 @@ class GudePDU(ICMPable):
         return [
             f'{self.port_state_oid}{i+1}' for i in range(self.num_powerfeeds)]
 
+    async def _snmp_get(self, oids):
+        """SNMP GET; returns the values as ints in the same order as `oids`."""
+        error_indication, error_status, error_index, var_binds = await get_cmd(
+            self.snmp_engine,
+            self.snmp_community,
+            await self._target(),
+            ContextData(),
+            *[ObjectType(ObjectIdentity(oid)) for oid in oids],
+        )
+        self._raise_on_snmp_error('GET', error_indication, error_status,
+                                  error_index, var_binds)
+        return [int(var_bind[1]) for var_bind in var_binds]
+
+    async def _snmp_set(self, messages):
+        """SNMP SET of (oid, int) pairs; returns the echoed values as ints,
+        in the same order as `messages`."""
+        error_indication, error_status, error_index, var_binds = await set_cmd(
+            self.snmp_engine,
+            self.snmp_community,
+            await self._target(),
+            ContextData(),
+            *[ObjectType(ObjectIdentity(oid), Integer32(value))
+              for oid, value in messages],
+        )
+        self._raise_on_snmp_error('SET', error_indication, error_status,
+                                  error_index, var_binds)
+        return [int(var_bind[1]) for var_bind in var_binds]
+
+    @staticmethod
+    def _raise_on_snmp_error(op, error_indication, error_status, error_index,
+                             var_binds):
+        if error_indication:
+            raise RuntimeError(f'SNMP {op} failed: {error_indication}')
+        if error_status:
+            at = '?'
+            if error_index and int(error_index) <= len(var_binds):
+                at = var_binds[int(error_index) - 1][0]
+            raise RuntimeError(
+                f'SNMP {op} error: {error_status.prettyPrint()} at {at}')
+
     async def online_event(self, _, event_type, value):
         if event_type == 'is_online':
             if value == DeviceState.ON:
                 await self.lock.acquire()
                 try:
-                    async with self.snmp_client as client:
-                        await self._read_powerfeeds(client)
+                    await self._read_powerfeeds()
                 except Exception as e:
                     logger.exception(self.name)
                     await self._handle_exception(e)
                     await self.set_is_online(DeviceState.PARTIAL)
                 self.lock.release()
 
-    async def _read_powerfeeds(self, client):
-        res = await client.get(self.port_state_oids)
-        powerfeeds = [x.value == 1 for x in res]
+    async def _read_powerfeeds(self):
+        values = await self._snmp_get(self.port_state_oids)
+        powerfeeds = [value == 1 for value in values]
 
         changed = not all([a == b for a, b in zip(
             powerfeeds, self._state['powerfeeds'])])
@@ -115,8 +181,7 @@ class GudePDU(ICMPable):
         if self.is_online == DeviceState.ON:
             await self.lock.acquire()
             try:
-                async with self.snmp_client as client:
-                    await self._read_powerfeeds(client)
+                await self._read_powerfeeds()
             except Exception as e:
                 await self._handle_exception(e)
             self.lock.release()
@@ -130,12 +195,11 @@ class GudePDU(ICMPable):
             while any([powerfeeds[i] != self._state['powerfeeds'][i] for i in range(self.num_powerfeeds)]):
                 async with self.lock:
                     try:
-                        async with self.snmp_client as client:
-                            res = await client.set(messages)
-                            self._state['powerfeeds'] = [x.value == 1 for x in res]
-                            logger.debug('%s powerfeeds %s', self.name,
-                                         self._state['powerfeeds'])
-                            await self.event('powerfeeds', self._state['powerfeeds'])
+                        values = await self._snmp_set(messages)
+                        self._state['powerfeeds'] = [value == 1 for value in values]
+                        logger.debug('%s powerfeeds %s', self.name,
+                                     self._state['powerfeeds'])
+                        await self.event('powerfeeds', self._state['powerfeeds'])
                     except Exception as e:
                         await self._handle_exception(e)
                         await asyncio.sleep(5)

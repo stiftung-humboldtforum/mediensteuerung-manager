@@ -1,7 +1,9 @@
-# Stays on 3.11: aiosnmp 0.7.2 (latest, unmaintained) ships no cp312 wheel, so
-# 3.12 would force a Rust source-build of aiosnmp. 3.11 has the cp311 wheel and
-# is supported until 2027. (api/calendar/knx/fac are on 3.12-slim.)
-FROM python:3.11-slim
+# Unified on python:3.12-slim with the rest of the stack (api/calendar/knx/fac).
+# SNMP runs on pysnmp (pure-Python, same lib as fac) and LG webOS TVs on
+# aiowebostv (maintained, native asyncio) — these replace the former native /
+# unmaintained aiosnmp + PyWebOSTV/ws4py/wsaccel stack that pinned this image
+# to 3.11. No native build step is required anymore.
+FROM python:3.12-slim
 RUN apt-get update && apt-get install -qq git iputils-ping
 RUN pip install --no-cache-dir --upgrade pip
 RUN pip install --no-cache-dir --upgrade \
@@ -13,8 +15,8 @@ RUN pip install --no-cache-dir --upgrade \
 	aiomqtt==2.5.1 \
 	paho-mqtt==2.1.0 \
 	pyyaml==6.0.3 \
-	aiosnmp==0.7.2 \
+	pysnmp==7.1.27 \
+	aiowebostv==0.7.5 \
 	git+https://github.com/worosom/aiopjlink@e9383cee5510aaaa9f23f1299643b02c424c2448
-RUN pip install --no-cache-dir PyWebOSTV==0.8.9 ws4py==0.6.0 wsaccel==0.6.7
 RUN echo "{}" > /opt/weboscreds.json
 WORKDIR /app

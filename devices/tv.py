@@ -5,12 +5,9 @@ from misc import logger, memoize
 import asyncio
 import json
 
-from pywebostv import connection, controls
-import wsaccel
-wsaccel.patch_ws4py()
+from aiowebostv import WebOsClient
 
-
-store = {}
+CREDS_PATH = '/opt/weboscreds.json'
 
 
 class LGWebOSTV(WOLable):
@@ -25,7 +22,11 @@ class LGWebOSTV(WOLable):
         self.update_methods.append(('register_client', self.register_client))
         self.loop = asyncio.get_running_loop()
         self.ip = getattr(self, 'primary_ip')['address'].split('/')[0]
-        self.init_client()
+        # aiowebostv client is created lazily inside the event loop on connect.
+        self.client: WebOsClient | None = None
+        # Guards against two concurrent connect attempts (online_event and the
+        # periodic register_client can both fire) creating duplicate clients.
+        self._connecting = False
 
     async def online_event(self, _, event_type, value):
         if event_type == 'is_online':
@@ -34,24 +35,72 @@ class LGWebOSTV(WOLable):
             if value == DeviceState.PARTIAL and not self.is_connected:
                 await self.try_connect()
 
-    def init_client(self):
-        self.webosclient = connection.WebOSClient(self.ip, secure=True)
-        logger.debug('webosclient created')
-        self.webosclient.closed = self.on_close
-        self.webosclient.opened = self.on_open
-        self.syscontrol = controls.SystemControl(self.webosclient)
+    def _load_client_key(self):
+        try:
+            with open(CREDS_PATH) as f:
+                return (json.load(f) or {}).get('client_key')
+        except (FileNotFoundError, ValueError):
+            return None
+
+    def _save_client_key(self, client_key):
+        if not client_key:
+            return
+        data = {}
+        try:
+            with open(CREDS_PATH) as f:
+                data = json.load(f) or {}
+        except (FileNotFoundError, ValueError):
+            data = {}
+        if data.get('client_key') != client_key:
+            data['client_key'] = client_key
+            with open(CREDS_PATH, 'w') as f:
+                json.dump(data, f)
+
+    def _set_online(self, connected):
+        # aiowebostv pairs as part of connect(), so is_connected and
+        # is_registered move together. is_registered's setter drives
+        # set_is_online; only flip it on an actual change.
+        if connected:
+            self.is_connected = True
+            if not self.is_registered:
+                self.is_registered = True
+        else:
+            if self.is_registered:
+                self.is_registered = False
+            self.is_connected = False
+
+    async def _disconnect_client(self):
+        if self.client is not None:
+            try:
+                await self.client.disconnect()
+            except Exception:
+                pass
+            self.client = None
+
+    async def _connect(self):
+        # connect() opens the websocket AND performs pairing (registration):
+        # with a stored client_key it reconnects silently, otherwise the TV
+        # shows a pairing prompt the first time.
+        self.client = WebOsClient(self.ip, client_key=self._load_client_key())
+        try:
+            async with asyncio.timeout(15):
+                await self.client.connect()
+        except Exception as e:
+            await self._disconnect_client()
+            logger.exception(e)
+            return
+        self._save_client_key(self.client.client_key)
+        self._set_online(True)
 
     async def try_connect(self):
-        if not self.is_connected:
-            logger.debug('try_connect start, not connected')
-            try:
-                logger.debug('try_connect webosclient connect')
-                async with asyncio.timeout(10):
-                    # ws4py connect() is blocking; run off the event loop
-                    await asyncio.to_thread(self.webosclient.connect)
-            except Exception as e:
-                self.webosclient.close()
-                logger.exception(e)
+        if self.is_connected or self._connecting:
+            return
+        logger.debug('try_connect start, not connected')
+        self._connecting = True
+        try:
+            await self._connect()
+        finally:
+            self._connecting = False
 
     @memoize(10)
     async def ping(self):
@@ -65,24 +114,19 @@ class LGWebOSTV(WOLable):
 
     @memoize(10)
     async def register_client(self):
-        if self.is_connected and not self.is_registered:
-            logger.debug('register...')
-            try:
-                # register() + file I/O are blocking; run off the event loop
-                await asyncio.to_thread(self._register_blocking)
-                self.is_registered = True
-                logger.debug('registered!')
-            except Exception as e:
-                await self._handle_exception(e)
-                self.init_client()
-
-    def _register_blocking(self):
-        with open('/opt/weboscreds.json', 'r+') as f:
-            store = json.loads(f.read())
-            list(self.webosclient.register(store, timeout=1))
-            f.seek(0)
-            f.write(json.dumps(store))
-            f.truncate()
+        # Reconcile our state with the real aiowebostv link and (re)connect
+        # while the device is reachable. Skip while a connect is in flight so
+        # we don't tear down the half-open client try_connect is building.
+        if self._connecting:
+            return
+        if self.client is not None and self.client.is_connected():
+            self._set_online(True)
+            return
+        if self.is_connected or self.is_registered:
+            self._set_online(False)
+        await self._disconnect_client()
+        if self.is_online == DeviceState.PARTIAL:
+            await self.try_connect()
 
     @property
     def is_connected(self):
@@ -112,20 +156,19 @@ class LGWebOSTV(WOLable):
         self._state['should_shutdown'] = value
         await self.event('should_shutdown', value)
 
-    def on_open(self, *_, **__):
-        logger.debug('try_connect webosclient connected')
-        self.is_connected = True
-
-    def on_close(self, *_, **__):
-        self.is_connected = False
-        self.init_client()
-
-    def on_shutdown_received(self, status, payload):
-        logger.debug('%s, %s', status, payload)
-        self.loop.create_task(self.set_should_shutdown(status))
-
     async def shutdown(self, *_, **__):
-        self.syscontrol.power_off(callback=self.on_shutdown_received)
+        try:
+            # The link may be briefly down while the TV is still physically on;
+            # try to (re)connect before giving up so the command isn't dropped.
+            if self.client is None or not self.client.is_connected():
+                await self.try_connect()
+            if self.client is not None and self.client.is_connected():
+                await self.client.power_off()
+                await self.set_should_shutdown(True)
+            else:
+                logger.warning('%s shutdown requested but not connected', self.name)
+        except Exception as e:
+            await self._handle_exception(e)
 
     async def fetch(self):
         await super().fetch()
