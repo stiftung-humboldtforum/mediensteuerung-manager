@@ -1,0 +1,10 @@
+asyncclick==8.3.0.7
+uvloop==0.22.1
+wakeonlan==3.3.0
+icmplib==3.0.4
+requests==2.34.2
+aiomqtt==2.5.1
+paho-mqtt==2.1.0
+pyyaml==6.0.3
+pysnmp==7.1.27
+aiowebostv==0.7.5
