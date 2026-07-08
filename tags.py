@@ -172,27 +172,90 @@ class Tag:
             self.has_calendar_event = False
         self.last_calendar_method = method_name
 
+    @property
+    def _av_devices(self) -> list[Device]:
+        # Everything a fire alarm should act on: all tagged devices EXCEPT the
+        # power/network infrastructure (PDUs, network switches), which stays up.
+        infra = [*self.pdus, *self.network_switches]
+        return [device for device in self.devices if device not in infra]
+
+    async def _scram_call(self, devices, method_name):
+        """Fire-safety dispatch. Filters on `_capabilities` (NOT the public
+        `capabilities` property, which returns [] for 'ctrl mon' control-only
+        devices to hide them from the UI — they must NOT be skipped during an
+        alarm). Each device is dispatched independently with its exception
+        swallowed+logged, so one flaky device can never abort the alarm for the
+        rest — a plain TaskGroup cancels the whole batch (and, via Location's
+        sequential loop, every later element) on the first raise. Returns the
+        devices actually dispatched to."""
+        targets = [d for d in devices if method_name in d._capabilities]
+
+        async def _dispatch(device):
+            try:
+                await getattr(device, method_name)()
+            except Exception:
+                logger.exception('Tag %s scram-%s failed for %s',
+                                 self.name, method_name, device.name)
+        await asyncio.gather(*[_dispatch(d) for d in targets])
+        if targets:
+            logger.debug('Tag %s scram-%s for %s', self.name,
+                         method_name, [d.name for d in targets])
+        return targets
+
+    async def _scram_power(self, devices, state):
+        """Last-resort power control for devices that can be neither muted nor
+        shut down (reboot-only signage players, wake-only, driverless): toggle
+        their PDU feed if they have one. Best-effort, per-device guarded."""
+        switched = []
+        for device in devices:
+            try:
+                if await device.set_power(state):
+                    switched.append(device)
+            except Exception:
+                logger.exception('Tag %s scram power=%s failed for %s',
+                                 self.name, state, device.name)
+        if switched:
+            logger.debug('Tag %s scram power=%s for %s', self.name,
+                         state, [d.name for d in switched])
+        return switched
+
     async def scram(self, **__):
         logger.error('BMZ Scram %s', self.name)
-        logger.error('BMZ Scram %s devices=%d computers=%d displays=%d mutable=%d',
-                 self.name, len(self.devices), len(self.computers),
-                 len(self.display_devices),
-                 len([d for d in self.computers if 'mute' in d._capabilities]))
-        mutable = [
-            device for device in self.computers if 'mute' in device._capabilities]
-        await self.call(mutable, 'mute')
-        other = [
-            device for device in self.computers if 'mute' not in device._capabilities]
-
-        await self.call_and_wait_for(other, 'shutdown', DeviceState.OFF)
-        await self.call(self.display_devices, 'shutdown')
+        # Classify by CAPABILITY, not by NetBox role: role classification
+        # (computers/display_devices) misses the live roles ('Video Player',
+        # 'Projektion', 'Medienstation *' variants …) entirely. Mute what can
+        # mute; shut down what can shut down; and for devices that can do
+        # NEITHER (reboot-only signage, wake-only, driverless) cut their PDU
+        # feed as a last resort — else they keep playing through the alarm.
+        # Infrastructure (PDUs, switches) is deliberately left up.
+        av = self._av_devices
+        mutable = [d for d in av if 'mute' in d._capabilities]
+        shutdownable = [d for d in av
+                        if 'mute' not in d._capabilities and 'shutdown' in d._capabilities]
+        uncontrollable = [d for d in av
+                          if 'mute' not in d._capabilities and 'shutdown' not in d._capabilities]
+        muted = await self._scram_call(mutable, 'mute')
+        shut = await self._scram_call(shutdownable, 'shutdown')
+        powercut = await self._scram_power(uncontrollable, False)
+        logger.error('BMZ Scram %s av=%d muted=%d shutdown=%d powercut=%d unreached=%d',
+                     self.name, len(av), len(muted), len(shut), len(powercut),
+                     len(uncontrollable) - len(powercut))
+        # Wait (bounded) only for devices we actually told to shut down; an
+        # explicit timeout avoids wait_for's max([]) ValueError when a dispatched
+        # device happens to carry an empty timeouts dict.
+        if shut:
+            await self.wait_for(shut, DeviceState.OFF, DeviceState.PARTIAL, timeout=300)
 
     async def unscram(self, **__):
         logger.error('BMZ Unscram %s', self.name)
-        unmutable = [
-            device for device in self.devices if 'unmute' in device._capabilities]
-        other = [
-            device for device in self.devices if 'unmute' not in device._capabilities]
-        await self.call(unmutable, 'unmute')
-        await self.call_and_wait_for(self.display_devices, 'wake', DeviceState.ON)
-        await self.call_and_wait_for(other, 'wake', DeviceState.ON)
+        av = self._av_devices
+        unmutable = [d for d in av if 'unmute' in d._capabilities]
+        wakeable = [d for d in av
+                    if 'unmute' not in d._capabilities and 'wake' in d._capabilities]
+        powerable = [d for d in av
+                     if 'unmute' not in d._capabilities and 'wake' not in d._capabilities]
+        await self._scram_call(unmutable, 'unmute')
+        woken = await self._scram_call(wakeable, 'wake')
+        await self._scram_power(powerable, True)
+        if woken:
+            await self.wait_for(woken, DeviceState.ON, timeout=300)
