@@ -131,13 +131,13 @@ aiosignal==1.4.0 \
     --hash=sha256:053243f8b92b990551949e63930a839ff0cf0b0ebbe0597b0f3fb19e1a0fe82e \
     --hash=sha256:f47eecd9468083c2029cc99945502cb7708b082c232f9aca65da147157b251c7
     # via aiohttp
-aiowebostv==0.7.5 \
-    --hash=sha256:88406409ce2fdbe7193f88df06db86304058135e13885847101b19e973f5b9b9 \
-    --hash=sha256:a900621298be87325ee2a40f46009d4cac5deb520b0c0a5e601ec86038b44c37
+aiowebostv==0.10.0 \
+    --hash=sha256:3902e99061c83c12211a3ce9607a2a6db8455167bda863e4f50a924cae1adeaf \
+    --hash=sha256:93ee7557fb49e7a59f2d4b54a1658c4edddcc8f99f9106189afae22bf3554bce
     # via -r requirements.in
-asyncclick==8.3.0.7 \
-    --hash=sha256:7607046de39a3f315867cad818849f973e29d350c10d92f251db3ff7600c6c7d \
-    --hash=sha256:8a80d8ac613098ee6a9a8f0248f60c66c273e22402cf3f115ed7f071acfc71d3
+asyncclick==8.4.2.1 \
+    --hash=sha256:8f259376ae8d4fcd91961c8ad3e85e9b63c9cf181a122201c7dfed3d7f6024b8 \
+    --hash=sha256:dbd533769c4e3ce831c05394027ea1cd606c09688e18abab13dbcfbf7dc5a142
     # via -r requirements.in
 attrs==26.1.0 \
     --hash=sha256:c647aa4a12dfbad9333ca4e71fe62ddc36f4e63b2d260a37a8b83d2f043ac309 \
@@ -687,9 +687,9 @@ pyasn1==0.6.3 \
     --hash=sha256:697a8ecd6d98891189184ca1fa05d1bb00e2f84b5977c481452050549c8a72cf \
     --hash=sha256:a80184d120f0864a52a073acc6fc642847d0be408e7c7252f31390c0f4eadcde
     # via pysnmp
-pysnmp==7.1.27 \
-    --hash=sha256:01ce32d1bb0a14e8e3410a43fb7a8a7b050ec06186dc9ec240fcefa4af8b963c \
-    --hash=sha256:314ad98d94d9ed445d4bb07721c374ec6ca4158fb41f92b9bc72feb9557513f7
+pysnmp==7.1.29 \
+    --hash=sha256:6d08124574c474853870f20d728b54335b42fb1e68068bbb486ec077b3d052cf \
+    --hash=sha256:d0da6726c4d35b1e57027c98e2065928656b0cc5d3ce5a60b3535e1825cc60ee
     # via -r requirements.in
 pyyaml==6.0.3 \
     --hash=sha256:00c4bdeba853cc34e7dd471f16b4114f4162dc03e6b7afcc2128711f0eca823c \
