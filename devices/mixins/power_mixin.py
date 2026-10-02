@@ -42,10 +42,11 @@ class PowerMixin:
         await asyncio.sleep(wait)
         await self.set_power(True)
 
-    async def async_power_cycle(self, wait):
+    async def async_power_cycle(self, wait, off_wait=None):
+        # off_wait = Dauer der stromlosen Phase, ohne Angabe wie wait
         await asyncio.sleep(wait)
         await self.set_power(False)
-        await asyncio.sleep(wait)
+        await asyncio.sleep(off_wait if off_wait is not None else wait)
         await self.set_power(True)
 
     def power_on(self, wait=30):
@@ -56,9 +57,10 @@ class PowerMixin:
         self._cancel_existing_power_task()
         self.power_task = asyncio.create_task(self.async_power_off(wait))
 
-    def power_cycle(self, wait=10):
+    def power_cycle(self, wait=10, off_wait=None):
         self._cancel_existing_power_task()
-        self.power_task = asyncio.create_task(self.async_power_cycle(wait))
+        self.power_task = asyncio.create_task(
+            self.async_power_cycle(wait, off_wait))
 
     def _cancel_existing_power_task(self):
         if self.power_task and not self.power_task.done():

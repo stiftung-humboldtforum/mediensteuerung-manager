@@ -221,7 +221,11 @@ class Computer(WOLable):
 
         def power_off_done(finished):
             logger.debug('%s power_off_done', self.name)
-            self.power_cycle(wait=10)
+            # 30 s stromlos statt 10 s: Beim Ausfall am 21.08.2026 blieb
+            # 3900-zg-re-02 nach der 10-s-Trennung WoL-taub, eine Trennung
+            # über 19,6 s weckte ihn. Die Marge bis zum Kappen bleibt bei
+            # 10 s. Läuft auf PROD seit 2026-08-21.
+            self.power_cycle(wait=10, off_wait=30)
             # _delete_task returns the callback; invoke it to actually drop the task
             self._delete_task('shutdown')(finished)
         task.add_done_callback(power_off_done)
