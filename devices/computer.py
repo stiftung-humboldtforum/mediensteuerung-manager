@@ -7,6 +7,10 @@ from misc import logger, memoize
 from .device import DeviceState
 from .wolable import WOLable
 
+PING_INTERVAL = 5
+PING_MAX_INTERVAL = 30
+SHUTDOWN_INTERVAL = 30
+
 initial_state = {
     'temperatures': {},
     'fans': {},
@@ -21,29 +25,15 @@ initial_state = {
 class Computer(WOLable):
     _capabilities = ['wake', 'shutdown', 'reboot']
 
-    def __init__(self,
-                 *args,
-                 ping_interval: float = 5,
-                 ping_max_interval: float = 30,
-                 shutdown_interval: float = 30,
-                 reboot_interval: float = 30,
-                 max_time_to_wake: float = 900,
-                 max_time_to_shutdown: float = 900,
-                 max_time_to_reboot: float = 900,
-                 **kwargs):
+    def __init__(self, *args, **kwargs):
         super().__init__(*args, should_icmp=False, **kwargs)
-        self.timeouts['wake'] = max_time_to_wake
-        self.timeouts['shutdown'] = max_time_to_shutdown
-        self.timeouts['reboot'] = max_time_to_reboot
-        self.intervals['ping'] = ping_interval
-        self.intervals['ping_max_interval'] = ping_max_interval
-        self.intervals['shutdown'] = shutdown_interval
-        self.intervals['reboot'] = reboot_interval
         self.probe_address = f'manager/{self.name}'
         self._state['should_shutdown'] = False
         self._state['should_reboot'] = False
         for key, val in initial_state.items():
             self._state[key] = val
+        self.timeouts['shutdown'] = 900
+        self.timeouts['reboot'] = 900
         self.last_ping_time = 0
         self.update_methods.append(('MQTT Watch online', self._watch_online))
         self.power_task = None
@@ -59,8 +49,11 @@ class Computer(WOLable):
 
             async def method(args):
                 method.__name__ = __name
-                payload = json.loads(args)
+                payload = {}
                 try:
+                    payload = json.loads(args)
+                    if name not in self._state:
+                        return
                     result = payload['data']['result']
                     if self._state[name] != result:
                         self._state[name] = result
@@ -73,7 +66,9 @@ class Computer(WOLable):
                         await self._handle_exception(e)
             return method
         else:
-            return getattr(self, __name)
+            # Delegate to the parent __getattr__ (Device); calling getattr(self, ...)
+            # here would re-enter this __getattr__ and recurse infinitely.
+            return super().__getattr__(__name)
 
     async def on_connect(self):
         await self.client.subscribe(self.probe_topic)
@@ -104,6 +99,17 @@ class Computer(WOLable):
 
     async def on_shutdown(self, _):
         pass
+        # await self.set_is_online(DeviceState.PARTIAL)
+        # try:
+        #     async with asyncio.timeout(60):
+        #         while await ping_address(self.ip):
+        #             await asyncio.sleep(5)
+        # except Exception as e:
+        #     logger.exception(e)
+        #     return
+        # await self.set_is_online(DeviceState.OFF)
+        # await self.set_should_shutdown(False)
+        # await self.client.unsubscribe(self.probe_topic)
 
     async def online_event(self, _, event_type, value):
         if event_type == 'is_online':
@@ -135,9 +141,9 @@ class Computer(WOLable):
         self._state['should_reboot'] = value
         await self.event('should_reboot', value)
 
-    @memoize('ping_interval')
+    @memoize(PING_INTERVAL)
     async def _watch_online(self):
-        is_online = time.time() - self.last_ping_time < self.intervals['ping_max_interval']
+        is_online = time.time() - self.last_ping_time < PING_MAX_INTERVAL
         if is_online:
             if not self.should_reboot:
                 await self.set_is_online(DeviceState.ON)
@@ -145,23 +151,27 @@ class Computer(WOLable):
             await self.set_is_online(DeviceState.OFF)
             await self.client.unsubscribe(self.probe_topic)
 
+    # @memoize(SHUTDOWN_INTERVAL, immediate_key='should_shutdown')
+    # @timeout('shutdown')
     async def _shutdown(self):
         async with asyncio.timeout(self.timeouts['shutdown']):
             while self.should_shutdown:
                 if self.is_online == DeviceState.ON:
                     self.last_ping_time = 0
                     await self.client.publish(f'{self.probe_address}/shutdown', qos=1)
-                    await asyncio.sleep(self.intervals['shutdown'])
+                    await asyncio.sleep(SHUTDOWN_INTERVAL)
                 elif self.is_online == DeviceState.OFF:
                     await self.set_should_shutdown(False)
                     await self.client.unsubscribe(self.probe_topic)
 
+    # @memoize(SHUTDOWN_INTERVAL, immediate_key='should_reboot')
+    # @timeout('reboot')
     async def _reboot(self):
         async with asyncio.timeout(self.timeouts['reboot']):
             while self.should_reboot:
                 if self.is_online == DeviceState.ON:
                     await self.client.publish(f'{self.probe_address}/reboot', qos=1)
-                    await asyncio.sleep(self.intervals['reboot_interval'])
+                    await asyncio.sleep(SHUTDOWN_INTERVAL)
 
     async def on_connected(self, *_):
         await self.set_is_online(DeviceState.ON)
@@ -198,17 +208,26 @@ class Computer(WOLable):
     async def shutdown(self, *_, **__):
         await self.cancel()
         logger.debug('Shutting down %s', self.name)
-        await self.set_should_shutdown(self.is_online == DeviceState.ON)
+        was_on = self.is_online == DeviceState.ON
+        await self.set_should_shutdown(was_on)
+        if not was_on:
+            # Already off — don't run a soft-shutdown task and don't power-cycle.
+            return
         if 'shutdown' in self.tasks:
             self.tasks['shutdown'].cancel()
         task = asyncio.create_task(self._try_method(
             self._shutdown, error_cb=self.set_should_shutdown(False)))
         self.tasks['shutdown'] = task
 
-        def power_off_done(_):
+        def power_off_done(finished):
             logger.debug('%s power_off_done', self.name)
-            self.power_cycle(wait=10)
-            self._delete_task('shutdown')
+            # 30 s stromlos statt 10 s: Beim Ausfall am 21.08.2026 blieb
+            # 3900-zg-re-02 nach der 10-s-Trennung WoL-taub, eine Trennung
+            # über 19,6 s weckte ihn. Die Marge bis zum Kappen bleibt bei
+            # 10 s. Läuft auf PROD seit 2026-08-21.
+            self.power_cycle(wait=10, off_wait=30)
+            # _delete_task returns the callback; invoke it to actually drop the task
+            self._delete_task('shutdown')(finished)
         task.add_done_callback(power_off_done)
 
     async def reboot(self, *_, **__):

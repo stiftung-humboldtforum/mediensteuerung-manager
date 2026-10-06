@@ -1,4 +1,3 @@
-import sys
 import traceback
 import json
 import time
@@ -25,9 +24,13 @@ class ErrorMixin:
             self.name = kwargs['name']
 
     async def _handle_exception(self, e):
-        _, _, tb = sys.exc_info()
-        tb_info = traceback.extract_tb(tb)
-        _, _, func, text = tb_info[-1]
+        # Use the exception's own traceback (works outside an active except frame,
+        # where sys.exc_info() would be (None, None, None) -> IndexError below).
+        tb_info = traceback.extract_tb(e.__traceback__)
+        if tb_info:
+            _, _, func, text = tb_info[-1]
+        else:
+            func, text = '?', ''
         error_name = f'[{self.name}]: {func}: {type(e).__name__} {text}'
         logger.debug('%s %s', error_name, e)
         await self.error(error_name, e.args)

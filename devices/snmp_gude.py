@@ -1,10 +1,19 @@
 import os
 import asyncio
-import traceback
 from functools import cached_property
 from typing import Sequence
 
-import aiosnmp
+from pysnmp.hlapi.v3arch.asyncio import (
+    CommunityData,
+    ContextData,
+    Integer32,
+    ObjectIdentity,
+    ObjectType,
+    SnmpEngine,
+    UdpTransportTarget,
+    get_cmd,
+    set_cmd,
+)
 
 from misc import logger, memoize
 
@@ -13,6 +22,9 @@ from .icmpable import ICMPable
 
 PDU_COMMUNITYSTRING = os.environ['PDU_COMMUNITYSTRING']
 
+SNMP_PORT = 161
+SNMP_TIMEOUT = 5
+SNMP_RETRIES = 2
 WRITE_POWERFEEDS_TIMEOUT = 900
 
 
@@ -58,17 +70,8 @@ def get_port_state_oid(device_model):
 
 
 class GudePDU(ICMPable):
-    def __init__(self,
-                 *args,
-                 watch_interval: float = 10,
-                 snmp_timeout: float = 5,
-                 snmp_retries: float = 2,
-                 write_powerfeeds_timeout: float = 900,
-                 **kwargs):
+    def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.intervals['watch'] = watch_interval
-        self.timeouts['write_powerfeeds'] = write_powerfeeds_timeout
-
         self.model = getattr(self, 'device_type')['model']
         try:
             self._state['powerfeeds'] = [-1] * self.num_powerfeeds
@@ -81,8 +84,22 @@ class GudePDU(ICMPable):
         self.event.append(self.online_event)
         ip = getattr(self, 'primary_ip')
         address = ip['address'].split('/')[0]
-        self.snmp_client = aiosnmp.Snmp(
-            host=address, community=PDU_COMMUNITYSTRING, timeout=snmp_timeout, retries=snmp_retries)
+        self.snmp_host = address
+        # pysnmp's asyncio HLAPI is call-based (no aiosnmp-style connection
+        # context manager): each get_cmd/set_cmd takes the engine + per-call
+        # transport target. One reusable SNMPv2c engine + community per device.
+        self.snmp_engine = SnmpEngine()
+        self.snmp_community = CommunityData(PDU_COMMUNITYSTRING, mpModel=1)
+        self._snmp_target = None
+
+    async def _target(self):
+        # Built lazily (UdpTransportTarget.create is async) and reused across
+        # GET/SET so the ~10s poller doesn't churn a new UDP socket each call.
+        if self._snmp_target is None:
+            self._snmp_target = await UdpTransportTarget.create(
+                (self.snmp_host, SNMP_PORT),
+                timeout=SNMP_TIMEOUT, retries=SNMP_RETRIES)
+        return self._snmp_target
 
     @cached_property
     def num_powerfeeds(self):
@@ -97,20 +114,61 @@ class GudePDU(ICMPable):
         return [
             f'{self.port_state_oid}{i+1}' for i in range(self.num_powerfeeds)]
 
+    async def _snmp_get(self, oids):
+        """SNMP GET; returns the values as ints in the same order as `oids`."""
+        error_indication, error_status, error_index, var_binds = await get_cmd(
+            self.snmp_engine,
+            self.snmp_community,
+            await self._target(),
+            ContextData(),
+            *[ObjectType(ObjectIdentity(oid)) for oid in oids],
+        )
+        self._raise_on_snmp_error('GET', error_indication, error_status,
+                                  error_index, var_binds)
+        return [int(var_bind[1]) for var_bind in var_binds]
+
+    async def _snmp_set(self, messages):
+        """SNMP SET of (oid, int) pairs; returns the echoed values as ints,
+        in the same order as `messages`."""
+        error_indication, error_status, error_index, var_binds = await set_cmd(
+            self.snmp_engine,
+            self.snmp_community,
+            await self._target(),
+            ContextData(),
+            *[ObjectType(ObjectIdentity(oid), Integer32(value))
+              for oid, value in messages],
+        )
+        self._raise_on_snmp_error('SET', error_indication, error_status,
+                                  error_index, var_binds)
+        return [int(var_bind[1]) for var_bind in var_binds]
+
+    @staticmethod
+    def _raise_on_snmp_error(op, error_indication, error_status, error_index,
+                             var_binds):
+        if error_indication:
+            raise RuntimeError(f'SNMP {op} failed: {error_indication}')
+        if error_status:
+            at = '?'
+            if error_index and int(error_index) <= len(var_binds):
+                at = var_binds[int(error_index) - 1][0]
+            raise RuntimeError(
+                f'SNMP {op} error: {error_status.prettyPrint()} at {at}')
+
     async def online_event(self, _, event_type, value):
         if event_type == 'is_online':
             if value == DeviceState.ON:
+                await self.lock.acquire()
                 try:
-                    async with self.snmp_client as client:
-                        await self._read_powerfeeds(client)
+                    await self._read_powerfeeds()
                 except Exception as e:
                     logger.exception(self.name)
                     await self._handle_exception(e)
                     await self.set_is_online(DeviceState.PARTIAL)
+                self.lock.release()
 
-    async def _read_powerfeeds(self, client):
-        res = await client.get(self.port_state_oids)
-        powerfeeds = [x.value == 1 for x in res]
+    async def _read_powerfeeds(self):
+        values = await self._snmp_get(self.port_state_oids)
+        powerfeeds = [value == 1 for value in values]
 
         changed = not all([a == b for a, b in zip(
             powerfeeds, self._state['powerfeeds'])])
@@ -118,13 +176,12 @@ class GudePDU(ICMPable):
             self._state['powerfeeds'] = powerfeeds
             await self.event('powerfeeds', self._state['powerfeeds'])
 
-    @memoize('watch')
+    @memoize(10)
     async def _watch_powerfeeds(self):
         if self.is_online == DeviceState.ON:
             await self.lock.acquire()
             try:
-                async with self.snmp_client as client:
-                    await self._read_powerfeeds(client)
+                await self._read_powerfeeds()
             except Exception as e:
                 await self._handle_exception(e)
             self.lock.release()
@@ -134,33 +191,30 @@ class GudePDU(ICMPable):
             return
         messages: Sequence = [(f'{self.port_state_oid}{i+1}', 1 if value else 0)
                               for i, value in enumerate(powerfeeds)]
-        async with asyncio.timeout(self.timeouts['write_powerfeeds']):
+        async with asyncio.timeout(WRITE_POWERFEEDS_TIMEOUT):
             while any([powerfeeds[i] != self._state['powerfeeds'][i] for i in range(self.num_powerfeeds)]):
-                await self.lock.acquire()
-                try:
-                    async with self.snmp_client as client:
-                        res = await client.set(messages)
-                        self._state['powerfeeds'] = [x.value == 1 for x in res]
+                async with self.lock:
+                    try:
+                        values = await self._snmp_set(messages)
+                        self._state['powerfeeds'] = [value == 1 for value in values]
                         logger.debug('%s powerfeeds %s', self.name,
                                      self._state['powerfeeds'])
                         await self.event('powerfeeds', self._state['powerfeeds'])
-                except Exception as e:
-                    await self._handle_exception(e)
-                    await asyncio.sleep(5)
-                self.lock.release()
+                    except Exception as e:
+                        await self._handle_exception(e)
+                        await asyncio.sleep(5)
 
     async def write_powerfeed(self, id=None, value=None):
         if id is None or value is None:
             return
 
-        while not self.is_ready:
-            await asyncio.sleep(1)
         logger.debug('name=%s, id=%s, value=%s', self.name, id, value)
         powerfeeds = [*self._state['powerfeeds']]
         powerfeeds[id] = value
         if '_write_powerfeeds' in self.tasks and not self.tasks['_write_powerfeeds'].done():
+            # Cancel the in-flight write; it now uses `async with self.lock`, which
+            # releases the lock on cancellation — so do NOT release it here.
             self.tasks['_write_powerfeeds'].cancel()
-            self.lock.release()
         task = asyncio.create_task(self._try_method(
             self._write_powerfeeds, powerfeeds=powerfeeds))
         self.tasks['_write_powerfeeds'] = task

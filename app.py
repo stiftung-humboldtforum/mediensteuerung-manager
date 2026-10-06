@@ -6,6 +6,7 @@ import time
 
 import asyncclick as click
 import uvloop
+from aiomqtt import MqttError
 
 from misc import logger
 from mqtt_client import Client
@@ -14,22 +15,15 @@ from manager import Manager
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 
-@click.command()
-@click.option('--ca_certificate', default='/opt/tls/ca_certificate.pem')
-@click.option('--client_certificate', default='/opt/tls/client_certificate.pem')
-@click.option('--client_key', default='/opt/tls/client_key.pem')
-async def main(ca_certificate, client_certificate, client_key):
-    ssl_context = ssl.create_default_context(cafile=ca_certificate)
-    ssl_context.load_cert_chain(
-        client_certificate, client_key)
-    loop = asyncio.get_event_loop()
+async def run(ssl_context):
+    loop = asyncio.get_running_loop()
     async with Client(
             os.environ['MQTT_HOSTNAME'],
-            client_id='manager',
+            identifier='manager',
             port=8883,
             keepalive=60,
             tls_context=ssl_context,
-            max_concurrent_outgoing_calls=2000
+            max_concurrent_outgoing_calls=2000,
     ) as client:
         client.pending_calls_threshold = 500
         await client.subscribe('api/#', qos=1)
@@ -40,12 +34,15 @@ async def main(ca_certificate, client_certificate, client_key):
         manager = Manager(client)
         await manager.setup(initial=True)
         manager_task = loop.create_task(manager.start())
-        async with client.messages() as messages:
-            async for message in messages:
-                # logger.debug(message.topic.value)
-                await manager.on_message(message.topic, message.payload)
+        try:
+            async for message in client.messages:
                 if message.topic.matches('probe/#'):
-                    _, fqdn, device_method = message.topic.value.split('/')
+                    topic_parts = message.topic.value.split('/')
+                    if len(topic_parts) != 3:
+                        logger.error('Malformed probe topic: %r (payload=%r)',
+                                     message.topic.value, message.payload[:200])
+                        continue
+                    _, fqdn, device_method = topic_parts
                     try:
                         device_id = [id for id, dev
                                      in manager.devices.items()
@@ -107,7 +104,25 @@ async def main(ca_certificate, client_certificate, client_key):
                             await manager.location_method(method_name, {'data': {'id': location_id}})
                 except Exception as e:
                     logger.exception(e)
-        await manager_task
+        finally:
+            manager_task.cancel()
+
+
+@click.command()
+@click.option('--ca_certificate', default='/opt/tls/ca_certificate.pem')
+@click.option('--client_certificate', default='/opt/tls/client_certificate.pem')
+@click.option('--client_key', default='/opt/tls/client_key.pem')
+async def main(ca_certificate, client_certificate, client_key):
+    ssl_context = ssl.create_default_context(cafile=ca_certificate)
+    ssl_context.load_cert_chain(
+        client_certificate, client_key)
+    # Reconnect with backoff instead of exiting on broker disconnect.
+    while True:
+        try:
+            await run(ssl_context)
+        except MqttError as e:
+            logger.error('MQTT connection lost (%s); reconnecting in 5s', e)
+            await asyncio.sleep(5)
 
 
 if __name__ == '__main__':

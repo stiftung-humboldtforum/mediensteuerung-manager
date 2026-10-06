@@ -7,3 +7,5 @@ from .tv import LGWebOSTV                    # pyright: ignore
 from .pjlink import PJLink                   # pyright: ignore
 from .snmp_gude import GudePDU               # pyright: ignore
 from .brightsign import BrightSign           # pyright: ignore
+from .sim_pdu import SimPDU                   # pyright: ignore
+from .sim_projector import SimProjector       # pyright: ignore

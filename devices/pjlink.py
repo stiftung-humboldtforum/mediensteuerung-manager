@@ -8,6 +8,9 @@ from misc import logger, memoize
 from .device import Device, DeviceState
 from .icmpable import ping_address
 
+WATCH_INTERVAL = 10
+WAKE_INTERVAL = 30
+SHUTDOWN_INTERVAL = 30
 
 initial_state = {
     'errors': {},
@@ -21,23 +24,12 @@ initial_state = {
 class PJLink(Device):
     _capabilities = ['wake', 'shutdown']
 
-    def __init__(self,
-                 *args,
-                 watch_interval: float = 10,
-                 wake_interval: float = 30,
-                 shutdown_interval: float = 30,
-                 max_time_to_wake: float = 900,
-                 max_time_to_shutdown=900,
-                 connection_timeout=10,
-                 **kwargs):
+    def __init__(self, *args, max_time_to_wake: float = 900, max_time_to_shutdown=900, connection_timeout=10, **kwargs):
         super().__init__(*args, **kwargs)
         self._state['should_wake'] = False
         self._state['should_shutdown'] = False
         self._reset_state()
 
-        self.intervals['watch'] = watch_interval
-        self.intervals['wake'] = wake_interval
-        self.intervals['shutdown'] = shutdown_interval
         self.timeouts['wake'] = max_time_to_wake
         self.timeouts['shutdown'] = max_time_to_shutdown
         self.connection_timeout = connection_timeout
@@ -47,15 +39,17 @@ class PJLink(Device):
         ip = getattr(self, 'primary_ip')
         address = ip['address'].split('/')[0]
         self.ip = address
-        self.is_open = False
 
+        self._interface = None
         self.update_methods.append(('PJLink watch', self._watch))
 
     async def _get_interface(self):
-        return PJLinkInterface(
-            address=self.ip,
-            password=os.environ['PJLINK_PASSWORD'],
-            timeout=self.connection_timeout)
+        async with self.lock:
+            _interface = PJLinkInterface(
+                address=self.ip,
+                password=os.environ['PJLINK_PASSWORD'],
+                timeout=self.connection_timeout)
+        return _interface
 
     def _reset_state(self):
         for key, value in initial_state.items():
@@ -67,22 +61,6 @@ class PJLink(Device):
             await self.set_should_shutdown(self.should_shutdown and value not in [DeviceState.OFF, DeviceState.PARTIAL])
             if value != DeviceState.ON:
                 self._reset_state()
-
-    async def _open(self):
-        if self._interface is None:
-            self._interface = await self._get_interface()
-        if not self.is_open:
-            try:
-                await self._interface.__aenter__()
-            except:
-                self._interface = await self._get_interface()
-                raise
-            self.is_open = True
-        return self._interface
-
-    async def _close(self):
-        await self._interface.__aexit__(None, None, None)
-        self.is_open = False
 
     async def _set_power_state(self, power_state: Power.State):
         match power_state:
@@ -107,14 +85,15 @@ class PJLink(Device):
                 self._state['warming'] = False
                 self._state['cooling'] = False
 
-    @memoize('watch')
+    @memoize(WATCH_INTERVAL)
     async def _watch(self):
+        if self._interface is None:
+            self._interface = await self._get_interface()
         if await ping_address(self.ip):
-            await self._open()
-            power_state = await self._interface.power.get()
-            await self._set_power_state(power_state)
-            await self._watch_status(self._interface)
-            await self._close()
+            async with self._interface as interface:
+                power_state = await interface.power.get()
+                await self._set_power_state(power_state)
+                await self._watch_status(interface)
         else:
             await self.set_is_online(DeviceState.OFF)
 
@@ -123,24 +102,16 @@ class PJLink(Device):
         for key, value in errors.items():
             error_name = key.value
             error_value = value.name.lower()
-            if error_name not in self._state['errors'] or self._state['errors'][key.value] != error_value:
+            if error_name not in self._state['errors'] or self._state['errors'][error_name] != error_value:
                 has_error_event = True
                 self._state['errors'][error_name] = error_value
         if has_error_event:
             await self.event('errors', self._state['errors'])
 
     async def _update_lamps(self, lamps):
-        has_lamps_event = self._state['lamps'] != len(lamps)
-        if has_lamps_event:
-            self._state['lamps'] = [(hours, int(state.value)) for hours, state in lamps]
-        else:
-            for i, lamp in enumerate(lamps):
-                lamp_hours = lamp[0]
-                lamp_state = int(lamp[1])
-                if lamp_hours != self._state['lamps'][i][0] or self._state['lamps'][i][1] != lamp_state:
-                    self._state['lamps'][i][0] = (lamp_hours, lamp_state)
-                    has_lamps_event = True
-        if has_lamps_event:
+        new_lamps = [(hours, int(state.value)) for hours, state in lamps]
+        if new_lamps != self._state['lamps']:
+            self._state['lamps'] = new_lamps
             await self.event('lamps', self._state['lamps'])
             
     async def _update_class(self, interface):
@@ -187,33 +158,31 @@ class PJLink(Device):
 
     async def _wake(self):
         async def inner():
-            await self._open()
-            logger.debug(
-                'Authentication succeeded, set_power on')
-            await self._interface.power.turn_on()
-            await self._close()
+            async with self._interface as interface:
+                logger.debug(
+                    'Authentication succeeded, set_power on')
+                await interface.power.turn_on()
         async with asyncio.timeout(self.timeouts['wake']):
             while self.should_wake:
                 if self.is_online in [DeviceState.OFF, DeviceState.PARTIAL]:
                     await self._try_method(inner)
-                    await asyncio.sleep(self.intervals['wake'])
+                    await asyncio.sleep(WAKE_INTERVAL)
                 elif self.is_online == DeviceState.ON:
                     await self.set_should_wake(False)
 
     async def _shutdown(self):
         async def inner():
-            await self._open()
-            logger.debug(
-                'Authentication succeeded, set_power off')
-            await self._interface.power.turn_off()
-            await self._close()
+            async with self._interface as interface:
+                logger.debug(
+                    'Authentication succeeded, set_power off')
+                await interface.power.turn_off()
         async with asyncio.timeout(self.timeouts['shutdown']):
             while self.should_shutdown:
                 if self.is_online == DeviceState.ON:
                     logger.debug('Try shutdown %s', self.name)
                     await self._try_method(inner)
                     self.power_off(300)
-                    await asyncio.sleep(self.intervals['shutdown'])
+                    await asyncio.sleep(SHUTDOWN_INTERVAL)
                 elif self.is_online in [DeviceState.OFF, DeviceState.PARTIAL]:
                     await self.set_should_shutdown(False)
 
