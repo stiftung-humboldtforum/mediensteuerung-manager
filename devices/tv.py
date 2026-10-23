@@ -23,7 +23,7 @@ class LGWebOSTV(WOLable):
         self.loop = asyncio.get_running_loop()
         self.ip = getattr(self, 'primary_ip')['address'].split('/')[0]
         # aiowebostv client is created lazily inside the event loop on connect.
-        self.client: WebOsClient | None = None
+        self.webos: WebOsClient | None = None
         # Guards against two concurrent connect attempts (online_event and the
         # periodic register_client can both fire) creating duplicate clients.
         self._connecting = False
@@ -70,26 +70,26 @@ class LGWebOSTV(WOLable):
             self.is_connected = False
 
     async def _disconnect_client(self):
-        if self.client is not None:
+        if self.webos is not None:
             try:
-                await self.client.disconnect()
+                await self.webos.disconnect()
             except Exception:
                 pass
-            self.client = None
+            self.webos = None
 
     async def _connect(self):
         # connect() opens the websocket AND performs pairing (registration):
         # with a stored client_key it reconnects silently, otherwise the TV
         # shows a pairing prompt the first time.
-        self.client = WebOsClient(self.ip, client_key=self._load_client_key())
+        self.webos = WebOsClient(self.ip, client_key=self._load_client_key())
         try:
             async with asyncio.timeout(15):
-                await self.client.connect()
+                await self.webos.connect()
         except Exception as e:
             await self._disconnect_client()
             logger.exception(e)
             return
-        self._save_client_key(self.client.client_key)
+        self._save_client_key(self.webos.client_key)
         self._set_online(True)
 
     async def try_connect(self):
@@ -119,7 +119,7 @@ class LGWebOSTV(WOLable):
         # we don't tear down the half-open client try_connect is building.
         if self._connecting:
             return
-        if self.client is not None and self.client.is_connected():
+        if self.webos is not None and self.webos.is_connected():
             self._set_online(True)
             return
         if self.is_connected or self.is_registered:
@@ -162,15 +162,15 @@ class LGWebOSTV(WOLable):
             # (re)connect before giving up so the command isn't dropped. If a
             # connect is already in flight (online_event/register_client), wait
             # for it to settle instead of bailing on the half-open client.
-            if self.client is None or not self.client.is_connected():
+            if self.webos is None or not self.webos.is_connected():
                 if self._connecting:
                     async with asyncio.timeout(20):
                         while self._connecting:
                             await asyncio.sleep(0.25)
                 else:
                     await self.try_connect()
-            if self.client is not None and self.client.is_connected():
-                await self.client.power_off()
+            if self.webos is not None and self.webos.is_connected():
+                await self.webos.power_off()
                 await self.set_should_shutdown(True)
             else:
                 logger.warning('%s shutdown requested but not connected', self.name)
