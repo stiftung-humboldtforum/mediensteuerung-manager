@@ -12,8 +12,9 @@ class BrightSign(ICMPable):
 
     async def reboot(self, *_, **__):
         ip = self.primary_ip['address'].split('/')[0]
-        username = os.environ.get('BRIGHTSIGN_USERNAME', 'admin')
-        password = os.environ.get('BRIGHTSIGN_PASSWORD', 'avm')
+        # Compose passes an unset variable as an empty string; `or` keeps the vendor default then.
+        username = os.environ.get('BRIGHTSIGN_USERNAME') or 'admin'
+        password = os.environ.get('BRIGHTSIGN_PASSWORD') or 'avm'
         # requests is blocking — run off the event loop with a timeout so an
         # unreachable player can't stall the whole manager loop.
         await asyncio.to_thread(
