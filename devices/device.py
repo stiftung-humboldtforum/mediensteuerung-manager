@@ -15,18 +15,15 @@ class Device(EventMixin, ErrorMixin, PowerMixin, CalendarMixin):
                  manager,
                  client: Client,
                  callback: Callable,
-                 offline_count_threshold: int = 3,
                  **kwargs):
         super().__init__(manager, client, callback, **kwargs)
         self.manager = manager
         self.client = client
-        self.offline_count_threshold = offline_count_threshold
-        self.set_data(**kwargs)
+        self.set_data(kwargs)
         self._state: dict[str, Any] = {}
         self._state['is_initialized'] = False
         self._state['is_online'] = DeviceState.OFF
         self._offline_counter = 0
-        self.intervals: dict[str, float] = {}
         self.timeouts: dict[str, float] = {}
         self.start_times: dict[str, float] = {}
         self.update_methods: list[tuple[str, Callable]] = []
@@ -34,20 +31,22 @@ class Device(EventMixin, ErrorMixin, PowerMixin, CalendarMixin):
         self.power_task = None
         self.lock = asyncio.Lock()
 
-    def set_data(self, **kwargs):
-        self.id: int = kwargs['id']
-        self.tags = kwargs['tags']
-        self.location = kwargs['location']
+    def set_data(self, data: dict[str, Any]):
+        self.id: int = data['id']
+        self.tags = data['tags']
+        self.location = data['location']
         try:
-            self.role = kwargs['device_role']['name']
+            # geändert: DA Update Netbox
+            # self.role = data['device_role']['name']
+            self.role = data['role']['name']
         except:
             self.role = ''
-        for key, value in kwargs.items():
+        for key, value in data.items():
             setattr(self, key, value)
         try:
-            self.name = kwargs['primary_ip']['dns_name']
+            self.name = data['primary_ip']['dns_name']
         except Exception:
-            self.name = kwargs['name']
+            self.name = data['name']
 
     async def setup(self):
         pass
@@ -95,7 +94,7 @@ class Device(EventMixin, ErrorMixin, PowerMixin, CalendarMixin):
 
     async def set_is_online(self, value):
         self._state['is_initialized'] = True
-        if value == DeviceState.OFF and self._offline_counter < self.offline_count_threshold:
+        if value == DeviceState.OFF and self._offline_counter < 3:
             self._offline_counter += 1
         else:
             self._offline_counter = 0

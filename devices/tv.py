@@ -16,10 +16,8 @@ store = {}
 class LGWebOSTV(WOLable):
     _capabilities = ['wake', 'shutdown']
 
-    def __init__(self, *args, ping_interval: float = 10, register_interval: float = 10, **kwargs):
+    def __init__(self, *args, **kwargs):
         super().__init__(*args, should_icmp=False, **kwargs)
-        self.intervals['ping'] = ping_interval
-        self.intervals['register'] = register_interval
         self._state['should_shutdown'] = False
         self._state['is_connected'] = False
         self._state['is_registered'] = False
@@ -54,7 +52,7 @@ class LGWebOSTV(WOLable):
                 self.webosclient.close()
                 logger.exception(e)
 
-    @memoize('ping')
+    @memoize(10)
     async def ping(self):
         if self.is_online != DeviceState.ON:
             if await ping_address(self.ip):
@@ -64,7 +62,7 @@ class LGWebOSTV(WOLable):
                 logger.debug('fail')
                 await self.set_is_online(DeviceState.OFF)
 
-    @memoize('register')
+    @memoize(10)
     async def register_client(self):
         if self.is_connected and not self.is_registered:
             logger.debug('register...')

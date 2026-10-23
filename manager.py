@@ -1,5 +1,6 @@
 import os
 import asyncio
+import time
 from typing import Any
 
 import requests
@@ -52,10 +53,11 @@ class Manager:
         self.api = Api()
         self.tasks: dict[str, asyncio.Task] = dict()
         self.lock = asyncio.Lock()
+        self.healthcheck()
 
     async def setup(self, initial=False):
         self.config = get_config()
-        self.device_map = self.config['device_map']
+        self.device_map = self.config['device_map']['value']
         await self.lock.acquire()
         try:
             response = self.api.get('/api/')
@@ -88,6 +90,11 @@ class Manager:
                 pass
         return wrap
 
+    def healthcheck(self):
+        if int(time.time()) % 30 == 0: 
+            with open('/tmp/health', 'w') as f:
+                f.write(str(time.time()))
+
     @timed(.125)
     async def update_devices(self):
         for device in self.devices.values():
@@ -95,6 +102,7 @@ class Manager:
                 task = asyncio.create_task(device.update())
                 self.tasks[device.name] = task
                 task.add_done_callback(self.delete_task(device.name))
+        self.healthcheck()
 
     async def start(self):
         while True:
@@ -126,17 +134,15 @@ class Manager:
             device_class_name,
             Device
         )
-        device_options = self.config['device_options'].get(device_class_name, {})
         if device_id in self.devices and device_class != type(self.devices[device_id]):
             await self.devices[device_id].cancel()
             del self.devices[device_id]
         if device_id not in self.devices:
             self.devices[device_id] = device_class(
-                self, self.client, self.device_event, **device, **device_options)
+                self, self.client, self.device_event, **device)
             act = 'Subscribed'
         else:
-            self.devices[device_id].set_data(**device_options,
-                                             **device)
+            self.devices[device_id].set_data(device)
             act = 'Updated'
         await self.devices[device_id].setup()
         logger.debug(f'{act} device: %s %s %s',

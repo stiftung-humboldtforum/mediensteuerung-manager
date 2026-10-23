@@ -45,7 +45,12 @@ async def main(ca_certificate, client_certificate, client_key):
                 # logger.debug(message.topic.value)
                 await manager.on_message(message.topic, message.payload)
                 if message.topic.matches('probe/#'):
-                    _, fqdn, device_method = message.topic.value.split('/')
+                    topic_parts = message.topic.value.split('/')
+                    if len(topic_parts) != 3:
+                        logger.error('Malformed probe topic: %r (payload=%r)',
+                                     message.topic.value, message.payload[:200])
+                        continue
+                    _, fqdn, device_method = topic_parts
                     try:
                         device_id = [id for id, dev
                                      in manager.devices.items()
