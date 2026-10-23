@@ -1,8 +1,8 @@
-# Unified on python:3.12-slim with the rest of the stack (api/calendar/knx/fac).
+# Same pinned base image as the rest of the stack (api/calendar/knx/fac).
 # SNMP runs on pysnmp (pure-Python, same lib as fac) and LG webOS TVs on
 # aiowebostv (maintained, native asyncio) — these replaced the former native /
 # unmaintained aiosnmp + PyWebOSTV/ws4py/wsaccel stack. No native build step.
-FROM python:3.12-slim
+FROM python:3.12.15-slim
 RUN apt-get update && apt-get install -qq git iputils-ping
 RUN pip install --no-cache-dir --upgrade pip
 
